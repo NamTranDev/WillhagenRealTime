@@ -1,0 +1,10 @@
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+aiohttp==3.9.1
+websockets==12.0
+beautifulsoup4==4.12.2
+# lxml==4.9.3  # Commented out due to build issues, using html.parser instead
+fake-useragent==1.4.0
+asyncio-throttle==1.0.2
+python-multipart==0.0.6
+aiofiles==23.2.1
