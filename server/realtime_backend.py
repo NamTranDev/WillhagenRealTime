@@ -13,6 +13,7 @@ Ngày tạo: 2024
 import asyncio
 import json
 import logging
+import os
 import random
 import time
 from datetime import datetime
@@ -104,6 +105,8 @@ class FreeProxyManager:
         self.logger = logging.getLogger("FreeProxyManager")
         self.last_fetch_time = None
         self.fetched_proxies = []
+        self.proxy_cache = {}  # Cache cho proxy đã test: {proxy: (is_working, timestamp)}
+        self.cache_duration = 3600  # Cache 1 giờ
         
     async def fetch_proxies_from_source(self, session: aiohttp.ClientSession, source: str) -> List[str]:
         """Fetch proxy từ một nguồn cụ thể"""
@@ -170,18 +173,47 @@ class FreeProxyManager:
         except:
             return False
     
+    def is_proxy_cached(self, proxy: str) -> Optional[bool]:
+        """Kiểm tra proxy có trong cache không và còn hiệu lực không"""
+        if proxy not in self.proxy_cache:
+            return None
+        
+        is_working, timestamp = self.proxy_cache[proxy]
+        now = datetime.now().timestamp()
+        
+        # Kiểm tra cache còn hiệu lực không
+        if now - timestamp > self.cache_duration:
+            del self.proxy_cache[proxy]
+            return None
+        
+        return is_working
+    
+    def cache_proxy_result(self, proxy: str, is_working: bool):
+        """Cache kết quả test proxy"""
+        self.proxy_cache[proxy] = (is_working, datetime.now().timestamp())
+    
     async def test_proxy(self, session: aiohttp.ClientSession, proxy: str) -> bool:
         """Test proxy có hoạt động không"""
+        # Kiểm tra cache trước
+        cached_result = self.is_proxy_cached(proxy)
+        if cached_result is not None:
+            self.logger.debug(f"Using cached result for proxy {proxy}: {cached_result}")
+            return cached_result
+        
         try:
             test_url = "http://httpbin.org/ip"
-            timeout = aiohttp.ClientTimeout(total=10)
+            timeout = aiohttp.ClientTimeout(total=3)  # Giảm timeout từ 10s xuống 3s
             
             async with session.get(test_url, proxy=proxy, timeout=timeout) as response:
                 if response.status == 200:
+                    self.cache_proxy_result(proxy, True)
                     return True
-                return False
+                else:
+                    self.cache_proxy_result(proxy, False)
+                    return False
         except Exception as e:
             self.logger.debug(f"Proxy test failed for {proxy}: {e}")
+            self.cache_proxy_result(proxy, False)
             return False
     
     async def fetch_and_test_proxies(self) -> List[str]:
@@ -208,22 +240,61 @@ class FreeProxyManager:
             
             # Test proxy và chỉ giữ lại những proxy hoạt động
             working_proxies = []
-            test_tasks = []
             
-            # Tạo tasks để test song song
-            for proxy in unique_proxies[:Config.MAX_FREE_PROXIES]:
-                task = asyncio.create_task(self.test_proxy(session, proxy))
-                test_tasks.append((proxy, task))
+            # Giới hạn số lượng proxy test để tăng tốc
+            max_test_proxies = min(Config.MAX_FREE_PROXIES, 50)  # Test tối đa 50 proxy
+            test_proxies = unique_proxies[:max_test_proxies]
             
-            # Chờ kết quả test
-            for proxy, task in test_tasks:
-                try:
-                    is_working = await task
-                    if is_working:
+            # Lọc proxy đã có trong cache
+            proxies_to_test = []
+            for proxy in test_proxies:
+                cached_result = self.is_proxy_cached(proxy)
+                if cached_result is not None:
+                    if cached_result:
                         working_proxies.append(proxy)
-                        self.logger.debug(f"Proxy working: {proxy}")
-                except Exception as e:
-                    self.logger.debug(f"Error testing proxy {proxy}: {e}")
+                        self.logger.debug(f"Using cached working proxy: {proxy}")
+                else:
+                    proxies_to_test.append(proxy)
+            
+            self.logger.info(f"Found {len(working_proxies)} cached working proxies, testing {len(proxies_to_test)} new proxies")
+            
+            if proxies_to_test:
+                # Tạo tasks để test song song với semaphore để giới hạn concurrent requests
+                semaphore = asyncio.Semaphore(15)  # Tối đa 15 proxy test cùng lúc
+                
+                async def test_proxy_with_semaphore(proxy):
+                    async with semaphore:
+                        return await self.test_proxy(session, proxy)
+                
+                # Tạo tasks để test song song
+                test_tasks = [test_proxy_with_semaphore(proxy) for proxy in proxies_to_test]
+                
+                # Chờ kết quả test với timeout
+                try:
+                    results = await asyncio.wait_for(
+                        asyncio.gather(*test_tasks, return_exceptions=True),
+                        timeout=20  # Timeout tổng cộng 20 giây
+                    )
+                    
+                    # Xử lý kết quả
+                    for i, result in enumerate(results):
+                        if isinstance(result, bool) and result:
+                            working_proxies.append(proxies_to_test[i])
+                            self.logger.debug(f"Proxy working: {proxies_to_test[i]}")
+                        elif isinstance(result, Exception):
+                            self.logger.debug(f"Error testing proxy {proxies_to_test[i]}: {result}")
+                            
+                except asyncio.TimeoutError:
+                    self.logger.warning("Proxy testing timed out, using partial results")
+                    # Lấy kết quả đã hoàn thành
+                    for i, task in enumerate(test_tasks):
+                        if task.done() and not task.cancelled():
+                            try:
+                                result = task.result()
+                                if result:
+                                    working_proxies.append(proxies_to_test[i])
+                            except Exception as e:
+                                self.logger.debug(f"Error in completed task: {e}")
             
             self.logger.info(f"Found {len(working_proxies)} working proxies")
             self.last_fetch_time = datetime.now()
@@ -569,9 +640,11 @@ class WillhabenCrawler:
                 
                 for advert in advert_summary_list:
                     try:
-                        car_info = self.extract_car_from_advert(advert)
-                        if car_info and car_info.get('id'):
-                            listings.append(car_info)
+                        car_model = self.extract_car_from_advert(advert)
+                        if car_model and car_model.get('id'):
+                            # Ghi advert vào file để trace theo ID
+                            #self.log_advert_to_file(advert, car_model)
+                            listings.append(car_model)
                     except Exception as e:
                         self.logger.debug(f"Lỗi khi parse advert: {e}")
                         continue
@@ -586,85 +659,336 @@ class WillhabenCrawler:
         
         return listings
     
-    def extract_car_from_advert(self, advert: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Trích xuất thông tin xe từ advert object"""
+    def log_advert_to_file(self, advert: Dict[str, Any], car_model: Dict[str, Any]) -> None:
+        """Ghi thông tin advert vào file để trace theo ID"""
         try:
-            car_info = {
+            # Tạo thư mục logs nếu chưa có
+            logs_dir = "logs"
+            if not os.path.exists(logs_dir):
+                os.makedirs(logs_dir)
+            
+            # Tạo tên file theo ID của advert
+            advert_id = car_model.get('id', 'unknown')
+            log_filename = os.path.join(logs_dir, f"advert_{advert_id}.json")
+            
+            # Chuẩn bị dữ liệu để ghi
+            log_data = {
+                'timestamp': datetime.now().isoformat(),
+                'advert_id': advert_id,
+                'car_model': car_model,
+                'raw_advert': advert,
+                'crawled_at': datetime.now().isoformat()
+            }
+            
+            # Ghi vào file JSON
+            with open(log_filename, 'w', encoding='utf-8') as f:
+                json.dump(log_data, f, ensure_ascii=False, indent=2)
+            
+            self.logger.info(f"Đã ghi advert {advert_id} vào file: {log_filename}")
+            
+            # Cập nhật file tổng hợp
+            self.update_summary_log(advert_id, car_model)
+            
+        except Exception as e:
+            self.logger.error(f"Lỗi khi ghi advert vào file: {e}")
+    
+    def update_summary_log(self, advert_id: str, car_model: Dict[str, Any]) -> None:
+        """Cập nhật file tổng hợp tất cả adverts đã tìm thấy"""
+        try:
+            logs_dir = "logs"
+            summary_file = os.path.join(logs_dir, "adverts_summary.json")
+            
+            # Đọc dữ liệu hiện tại nếu file đã tồn tại
+            summary_data = []
+            if os.path.exists(summary_file):
+                try:
+                    with open(summary_file, 'r', encoding='utf-8') as f:
+                        summary_data = json.load(f)
+                except (json.JSONDecodeError, FileNotFoundError):
+                    summary_data = []
+            
+            # Thêm thông tin advert mới
+            advert_entry = {
+                'advert_id': advert_id,
+                'title': car_model.get('title', ''),
+                'make': car_model.get('car_info', {}).get('make', ''),
+                'model': car_model.get('car_info', {}).get('model', ''),
+                'year': car_model.get('car_info', {}).get('year', ''),
+                'mileage': car_model.get('car_info', {}).get('mileage', ''),
+                'fuel_type': car_model.get('car_info', {}).get('fuel_type_resolved', ''),
+                'transmission': car_model.get('car_info', {}).get('transmission_resolved', ''),
+                'price': car_model.get('pricing', {}).get('price_display', ''),
+                'price_amount': car_model.get('pricing', {}).get('price_amount', ''),
+                'location': car_model.get('location', {}).get('city', ''),
+                'seller': car_model.get('seller', {}).get('org_name', ''),
+                'url': car_model.get('url', ''),
+                'first_seen': datetime.now().isoformat(),
+                'last_seen': datetime.now().isoformat()
+            }
+            
+            # Kiểm tra xem advert đã tồn tại chưa
+            existing_index = None
+            for i, entry in enumerate(summary_data):
+                if entry.get('advert_id') == advert_id:
+                    existing_index = i
+                    break
+            
+            if existing_index is not None:
+                # Cập nhật thời gian last_seen
+                summary_data[existing_index]['last_seen'] = datetime.now().isoformat()
+            else:
+                # Thêm advert mới
+                summary_data.append(advert_entry)
+            
+            # Ghi lại file tổng hợp
+            with open(summary_file, 'w', encoding='utf-8') as f:
+                json.dump(summary_data, f, ensure_ascii=False, indent=2)
+            
+        except Exception as e:
+            self.logger.error(f"Lỗi khi cập nhật summary log: {e}")
+    
+    def extract_car_from_advert(self, advert: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Trích xuất thông tin xe từ advert object thành model dữ liệu chi tiết"""
+        try:
+            # Tạo model dữ liệu chi tiết
+            car_model = {
+                # Thông tin cơ bản
                 'id': str(advert.get('id', '')),
                 'title': advert.get('description', ''),
                 'url': advert.get('selfLink', ''),
-                'status': advert.get('advertStatus', {}),
+                'seo_url': '',
+                'crawled_at': datetime.now().isoformat(),
+                
+                # Thông tin trạng thái
+                'status': {
+                    'id': advert.get('advertStatus', {}).get('id', ''),
+                    'description': advert.get('advertStatus', {}).get('description', ''),
+                    'statusId': advert.get('advertStatus', {}).get('statusId', '')
+                },
+                
+                # Thông tin phân loại
                 'adTypeId': advert.get('adTypeId'),
                 'productId': advert.get('productId'),
                 'verticalId': advert.get('verticalId'),
-                'crawled_at': datetime.now().isoformat()
+                
+                # Thông tin xe
+                'car_info': {
+                    'make': '',
+                    'model': '',
+                    'model_specification': '',
+                    'year': '',
+                    'mileage': '',
+                    'fuel_type': '',
+                    'fuel_type_resolved': '',
+                    'transmission': '',
+                    'transmission_resolved': '',
+                    'condition': '',
+                    'condition_resolved': '',
+                    'car_type': '',
+                    'exterior_color': '',
+                    'engine_power': '',
+                    'no_of_seats': '',
+                    'warranty': '',
+                    'warranty_resolved': ''
+                },
+                
+                # Thông tin giá cả
+                'pricing': {
+                    'price': '',
+                    'price_display': '',
+                    'price_amount': '',
+                    'is_private': False,
+                    'motor_price_bonus_trade_in': False,
+                    'motor_price_bonus_finance': False
+                },
+                
+                # Thông tin địa điểm
+                'location': {
+                    'address': '',
+                    'postcode': '',
+                    'city': '',
+                    'state': '',
+                    'country': '',
+                    'coordinates': '',
+                    'district': ''
+                },
+                
+                # Thông tin người bán
+                'seller': {
+                    'org_id': '',
+                    'org_name': '',
+                    'org_uuid': '',
+                    'is_private': False,
+                    'is_autodealer': False,
+                    'logo_url': ''
+                },
+                
+                # Thông tin hình ảnh
+                'images': {
+                    'main_image': '',
+                    'thumbnail': '',
+                    'all_images': [],
+                    'image_count': 0
+                },
+                
+                # Thông tin thiết bị/trang bị
+                'equipment': {
+                    'equipment_ids': '',
+                    'equipment_resolved': []
+                },
+                
+                # Thông tin thời gian
+                'timing': {
+                    'published': '',
+                    'published_string': '',
+                    'last_updated': '',
+                    'is_bumped': False
+                },
+                
+                # Thông tin bổ sung
+                'additional': {
+                    'defects_liability': False,
+                    'condition_report': False,
+                    'body_dyn': '',
+                    'source': '',
+                    'ad_uuid': '',
+                    'fnmmocount': 0
+                }
             }
             
             # Trích xuất thông tin từ attributes
             if 'attributes' in advert and advert['attributes']:
-                for attr in advert['attributes']:
-                    if 'name' in attr and 'value' in attr:
-                        attr_name = attr['name'].lower()
-                        attr_value = attr['value']
+                attributes = advert['attributes'].get('attribute', [])
+                for attr in attributes:
+                    if 'name' in attr and 'values' in attr and attr['values']:
+                        attr_name = attr['name']
+                        attr_value = attr['values'][0] if attr['values'] else ''
                         
-                        # Map các attributes phổ biến
-                        if 'price' in attr_name or 'preis' in attr_name:
-                            car_info['price'] = attr_value
-                        elif 'year' in attr_name or 'jahr' in attr_name:
-                            car_info['year'] = attr_value
-                        elif 'km' in attr_name or 'kilometer' in attr_name:
-                            car_info['mileage'] = attr_value
-                        elif 'fuel' in attr_name or 'kraftstoff' in attr_name:
-                            car_info['fuel'] = attr_value
-                        elif 'power' in attr_name or 'leistung' in attr_name:
-                            car_info['power'] = attr_value
-                        elif 'transmission' in attr_name or 'getriebe' in attr_name:
-                            car_info['transmission'] = attr_value
-                        elif 'color' in attr_name or 'farbe' in attr_name:
-                            car_info['color'] = attr_value
-                        elif 'brand' in attr_name or 'marke' in attr_name:
-                            car_info['brand'] = attr_value
-                        elif 'model' in attr_name or 'modell' in attr_name:
-                            car_info['model'] = attr_value
-                        elif 'location' in attr_name or 'standort' in attr_name:
-                            car_info['location'] = attr_value
-            
-            # Trích xuất thông tin từ teaserAttributes
-            if 'teaserAttributes' in advert and advert['teaserAttributes']:
-                for teaser in advert['teaserAttributes']:
-                    if 'name' in teaser and 'value' in teaser:
-                        teaser_name = teaser['name'].lower()
-                        teaser_value = teaser['value']
+                        # Thông tin xe
+                        if attr_name == 'CAR_MODEL/MAKE':
+                            car_model['car_info']['make'] = attr_value
+                        elif attr_name == 'CAR_MODEL/MODEL':
+                            car_model['car_info']['model'] = attr_value
+                        elif attr_name == 'CAR_MODEL/MODEL_SPECIFICATION':
+                            car_model['car_info']['model_specification'] = attr_value
+                        elif attr_name == 'YEAR_MODEL':
+                            car_model['car_info']['year'] = attr_value
+                        elif attr_name == 'MILEAGE':
+                            car_model['car_info']['mileage'] = attr_value
+                        elif attr_name == 'ENGINE/FUEL':
+                            car_model['car_info']['fuel_type'] = attr_value
+                        elif attr_name == 'ENGINE/FUEL_RESOLVED':
+                            car_model['car_info']['fuel_type_resolved'] = attr_value
+                        elif attr_name == 'TRANSMISSION':
+                            car_model['car_info']['transmission'] = attr_value
+                        elif attr_name == 'TRANSMISSION_RESOLVED':
+                            car_model['car_info']['transmission_resolved'] = attr_value
+                        elif attr_name == 'CONDITION':
+                            car_model['car_info']['condition'] = attr_value
+                        elif attr_name == 'CONDITION_RESOLVED':
+                            car_model['car_info']['condition_resolved'] = attr_value
+                        elif attr_name == 'CAR_TYPE':
+                            car_model['car_info']['car_type'] = attr_value
+                        elif attr_name == 'EXTERIORCOLOURMAIN':
+                            car_model['car_info']['exterior_color'] = attr_value
+                        elif attr_name == 'ENGINE/EFFECT':
+                            car_model['car_info']['engine_power'] = attr_value
+                        elif attr_name == 'NOOFSEATS':
+                            car_model['car_info']['no_of_seats'] = attr_value
+                        elif attr_name == 'WARRANTY':
+                            car_model['car_info']['warranty'] = attr_value
+                        elif attr_name == 'WARRANTY_RESOLVED':
+                            car_model['car_info']['warranty_resolved'] = attr_value
                         
-                        # Map các teaser attributes
-                        if 'price' in teaser_name or 'preis' in teaser_name:
-                            if 'price' not in car_info:
-                                car_info['price'] = teaser_value
-                        elif 'year' in teaser_name or 'jahr' in teaser_name:
-                            if 'year' not in car_info:
-                                car_info['year'] = teaser_value
-                        elif 'km' in teaser_name or 'kilometer' in teaser_name:
-                            if 'mileage' not in car_info:
-                                car_info['mileage'] = teaser_value
+                        # Thông tin giá cả
+                        elif attr_name == 'PRICE':
+                            car_model['pricing']['price'] = attr_value
+                        elif attr_name == 'PRICE_FOR_DISPLAY':
+                            car_model['pricing']['price_display'] = attr_value
+                        elif attr_name == 'PRICE/AMOUNT':
+                            car_model['pricing']['price_amount'] = attr_value
+                        elif attr_name == 'ISPRIVATE':
+                            car_model['pricing']['is_private'] = attr_value == '1'
+                        elif attr_name == 'MOTOR_PRICE_BONUS/TRADE_IN':
+                            car_model['pricing']['motor_price_bonus_trade_in'] = attr_value.lower() == 'true'
+                        elif attr_name == 'MOTOR_PRICE_BONUS/FINANCE':
+                            car_model['pricing']['motor_price_bonus_finance'] = attr_value.lower() == 'true'
+                        
+                        # Thông tin địa điểm
+                        elif attr_name == 'ADDRESS':
+                            car_model['location']['address'] = attr_value
+                        elif attr_name == 'POSTCODE':
+                            car_model['location']['postcode'] = attr_value
+                        elif attr_name == 'LOCATION':
+                            car_model['location']['city'] = attr_value
+                        elif attr_name == 'STATE':
+                            car_model['location']['state'] = attr_value
+                        elif attr_name == 'COUNTRY':
+                            car_model['location']['country'] = attr_value
+                        elif attr_name == 'COORDINATES':
+                            car_model['location']['coordinates'] = attr_value
+                        elif attr_name == 'DISTRICT':
+                            car_model['location']['district'] = attr_value
+                        
+                        # Thông tin người bán
+                        elif attr_name == 'ORGID':
+                            car_model['seller']['org_id'] = attr_value
+                        elif attr_name == 'ORGNAME':
+                            car_model['seller']['org_name'] = attr_value
+                        elif attr_name == 'ORG_UUID':
+                            car_model['seller']['org_uuid'] = attr_value
+                        elif attr_name == 'ISPRIVATE':
+                            car_model['seller']['is_private'] = attr_value == '1'
+                        elif attr_name == 'AUTDEALER':
+                            car_model['seller']['is_autodealer'] = attr_value == '1'
+                        elif attr_name == 'AD_SEARCHRESULT_LOGO':
+                            car_model['seller']['logo_url'] = f"https://cache.willhaben.at/{attr_value}"
+                        
+                        # Thông tin thiết bị
+                        elif attr_name == 'EQUIPMENT':
+                            car_model['equipment']['equipment_ids'] = attr_value
+                        elif attr_name == 'EQUIPMENT_RESOLVED':
+                            car_model['equipment']['equipment_resolved'] = attr['values']
+                        
+                        # Thông tin thời gian
+                        elif attr_name == 'PUBLISHED':
+                            car_model['timing']['published'] = attr_value
+                        elif attr_name == 'PUBLISHED_String':
+                            car_model['timing']['published_string'] = attr_value
+                        elif attr_name == 'LAST_UPDATED':
+                            car_model['timing']['last_updated'] = attr_value
+                        elif attr_name == 'IS_BUMPED':
+                            car_model['timing']['is_bumped'] = attr_value == '1'
+                        
+                        # Thông tin bổ sung
+                        elif attr_name == 'DEFECTS_LIABILITY':
+                            car_model['additional']['defects_liability'] = attr_value == '1'
+                        elif attr_name == 'CONDITION_REPORT':
+                            car_model['additional']['condition_report'] = attr_value == '1'
+                        elif attr_name == 'BODY_DYN':
+                            car_model['additional']['body_dyn'] = attr_value
+                        elif attr_name == 'SOURCE':
+                            car_model['additional']['source'] = attr_value
+                        elif attr_name == 'AD_UUID':
+                            car_model['additional']['ad_uuid'] = attr_value
+                        elif attr_name == 'fnmmocount':
+                            car_model['additional']['fnmmocount'] = int(attr_value) if attr_value.isdigit() else 0
+                        elif attr_name == 'SEO_URL':
+                            car_model['seo_url'] = attr_value
             
-            # Trích xuất thông tin từ advertiserInfo
-            if 'advertiserInfo' in advert and advert['advertiserInfo']:
-                advertiser = advert['advertiserInfo']
-                if 'name' in advertiser:
-                    car_info['dealer'] = advertiser['name']
-                if 'location' in advertiser:
-                    car_info['dealer_location'] = advertiser['location']
+            # Trích xuất thông tin hình ảnh
+            if 'advertImageList' in advert and 'advertImage' in advert['advertImageList']:
+                images = advert['advertImageList']['advertImage']
+                if images:
+                    car_model['images']['main_image'] = images[0].get('mainImageUrl', '')
+                    car_model['images']['thumbnail'] = images[0].get('thumbnailImageUrl', '')
+                    car_model['images']['all_images'] = [img.get('mainImageUrl', '') for img in images]
+                    car_model['images']['image_count'] = len(images)
             
-            # Trích xuất thông tin từ advertImageList
-            if 'advertImageList' in advert and advert['advertImageList']:
-                images = advert['advertImageList']
-                if isinstance(images, list) and len(images) > 0:
-                    car_info['images'] = images
-            
-            return car_info
+            return car_model
             
         except Exception as e:
-            self.logger.error(f"Lỗi khi extract car info từ advert: {e}")
+            self.logger.error(f"Lỗi khi extract car model từ advert: {e}")
             return None
     
     def extract_car_info(self, container) -> Optional[Dict[str, Any]]:
@@ -753,7 +1077,14 @@ class WillhabenCrawler:
                 self.seen_ids.add(listing['id'])
                 new_listings.append(listing)
                 self.stats["new_items_found"] += 1
-                self.logger.info(f"New listing found: {listing.get('title', 'N/A')} - {listing.get('price', 'N/A')}")
+                # Log thông tin chi tiết hơn
+                car_info = listing.get('car_info', {})
+                pricing = listing.get('pricing', {})
+                price_display = pricing.get('price_display', pricing.get('price', 'N/A'))
+                make = car_info.get('make', 'N/A')
+                model = car_info.get('model', 'N/A')
+                year = car_info.get('year', 'N/A')
+                self.logger.info(f"New listing found: {make} {model} ({year}) - {price_display}")
         
         self.total_crawled += len(listings)
         self.stats["last_crawl_time"] = datetime.now()
@@ -783,9 +1114,11 @@ class WillhabenCrawler:
                 # Gửi tin mới qua WebSocket
                 if new_listings:
                     for listing in new_listings:
+                        # Chuyển đổi car_model thành format đơn giản cho WebSocket
+                        websocket_data = self.convert_car_model_for_websocket(listing)
                         await self.websocket_manager.broadcast({
                             'type': 'new_listing',
-                            'data': listing,
+                            'data': websocket_data,
                             'timestamp': datetime.now().isoformat()
                         })
                 
@@ -805,6 +1138,57 @@ class WillhabenCrawler:
         """Dừng crawler"""
         self.is_running = False
         self.logger.info("Crawler stopped")
+    
+    def convert_car_model_for_websocket(self, car_model: Dict[str, Any]) -> Dict[str, Any]:
+        """Chuyển đổi car_model phức tạp thành format đơn giản cho WebSocket"""
+        try:
+            # Lấy thông tin từ car_model nested structure
+            car_info = car_model.get('car_info', {})
+            pricing = car_model.get('pricing', {})
+            location = car_model.get('location', {})
+            seller = car_model.get('seller', {})
+            images = car_model.get('images', {})
+            timing = car_model.get('timing', {})
+            
+            return {
+                'id': car_model.get('id', ''),
+                'title': car_model.get('title', ''),
+                'price': pricing.get('price_display', pricing.get('price', '')),
+                'year': car_info.get('year', ''),
+                'mileage': car_info.get('mileage', ''),
+                'fuel': car_info.get('fuel_type_resolved', car_info.get('fuel_type', '')),
+                'brand': car_info.get('make', ''),
+                'model': car_info.get('model', ''),
+                'location': location.get('city', location.get('address', '')),
+                'seller': seller.get('org_name', ''),
+                'url': car_model.get('url', ''),
+                'image_url': images.get('main_image', images.get('thumbnail', '')),
+                'crawled_at': car_model.get('crawled_at', ''),
+                'source': 'willhaben.at',
+                'transmission': car_info.get('transmission_resolved', car_info.get('transmission', '')),
+                'last_updated': timing.get('last_updated', '')
+            }
+        except Exception as e:
+            self.logger.error(f"Lỗi khi convert car_model cho WebSocket: {e}")
+            # Fallback về format cơ bản
+            return {
+                'id': car_model.get('id', ''),
+                'title': car_model.get('title', ''),
+                'price': 'N/A',
+                'year': 'N/A',
+                'mileage': 'N/A',
+                'fuel': 'N/A',
+                'brand': 'N/A',
+                'model': 'N/A',
+                'location': 'N/A',
+                'seller': 'N/A',
+                'url': car_model.get('url', ''),
+                'image_url': '',
+                'crawled_at': car_model.get('crawled_at', ''),
+                'source': 'willhaben.at',
+                'transmission': 'N/A',
+                'last_updated': ''
+            }
     
     def get_stats(self) -> Dict[str, Any]:
         """Lấy thống kê crawler"""
@@ -915,6 +1299,101 @@ async def get_cars():
         "cars": list(crawler.seen_ids),
         "last_crawl_time": crawler.get_stats()["last_crawl_time"]
     }
+
+
+@app.get("/cars/detailed")
+async def get_cars_detailed(sort_by: str = "last_updated", limit: int = 100):
+    """Lấy danh sách xe chi tiết với khả năng sort"""
+    try:
+        import os
+        import json
+        from datetime import datetime
+        
+        logs_dir = "logs"
+        if not os.path.exists(logs_dir):
+            return {
+                "total_cars": 0,
+                "cars": [],
+                "message": "No logs directory found"
+            }
+        
+        # Lấy danh sách tất cả file advert
+        advert_files = [f for f in os.listdir(logs_dir) if f.startswith("advert_") and f.endswith(".json")]
+        
+        cars_data = []
+        
+        for file_name in advert_files:
+            try:
+                file_path = os.path.join(logs_dir, file_name)
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                
+                if 'car_model' in data:
+                    car_model = data['car_model']
+                    
+                    # Thêm thông tin sorting
+                    car_info = {
+                        'id': car_model.get('id', ''),
+                        'title': car_model.get('title', ''),
+                        'make': car_model.get('car_info', {}).get('make', ''),
+                        'model': car_model.get('car_info', {}).get('model', ''),
+                        'year': car_model.get('car_info', {}).get('year', ''),
+                        'mileage': car_model.get('car_info', {}).get('mileage', ''),
+                        'fuel_type': car_model.get('car_info', {}).get('fuel_type_resolved', ''),
+                        'transmission': car_model.get('car_info', {}).get('transmission_resolved', ''),
+                        'price': car_model.get('pricing', {}).get('price_display', ''),
+                        'price_amount': car_model.get('pricing', {}).get('price_amount', ''),
+                        'location': car_model.get('location', {}).get('city', ''),
+                        'seller': car_model.get('seller', {}).get('org_name', ''),
+                        'url': car_model.get('url', ''),
+                        'main_image': car_model.get('images', {}).get('main_image', ''),
+                        'thumbnail': car_model.get('images', {}).get('thumbnail', ''),
+                        'image_count': car_model.get('images', {}).get('image_count', 0),
+                        'last_updated': car_model.get('timing', {}).get('last_updated', ''),
+                        'published': car_model.get('timing', {}).get('published_string', ''),
+                        'crawled_at': car_model.get('crawled_at', ''),
+                        'is_private': car_model.get('pricing', {}).get('is_private', False),
+                        'warranty': car_model.get('car_info', {}).get('warranty_resolved', ''),
+                        'equipment_count': len(car_model.get('equipment', {}).get('equipment_resolved', []))
+                    }
+                    
+                    cars_data.append(car_info)
+                    
+            except Exception as e:
+                continue
+        
+        # Sort theo last_updated (mặc định) hoặc các trường khác
+        if sort_by == "last_updated":
+            cars_data.sort(key=lambda x: x.get('last_updated', ''), reverse=True)
+        elif sort_by == "published":
+            cars_data.sort(key=lambda x: x.get('published', ''), reverse=True)
+        elif sort_by == "crawled_at":
+            cars_data.sort(key=lambda x: x.get('crawled_at', ''), reverse=True)
+        elif sort_by == "price_amount":
+            cars_data.sort(key=lambda x: float(x.get('price_amount', 0)) if x.get('price_amount', '').replace('.', '').isdigit() else 0, reverse=True)
+        elif sort_by == "year":
+            cars_data.sort(key=lambda x: int(x.get('year', 0)) if x.get('year', '').isdigit() else 0, reverse=True)
+        elif sort_by == "mileage":
+            cars_data.sort(key=lambda x: int(x.get('mileage', 0)) if x.get('mileage', '').replace(',', '').isdigit() else 0)
+        
+        # Giới hạn số lượng kết quả
+        if limit > 0:
+            cars_data = cars_data[:limit]
+        
+        return {
+            "total_cars": len(cars_data),
+            "cars": cars_data,
+            "sort_by": sort_by,
+            "limit": limit,
+            "last_crawl_time": crawler.get_stats()["last_crawl_time"]
+        }
+        
+    except Exception as e:
+        return {
+            "error": f"Error getting detailed cars: {str(e)}",
+            "total_cars": 0,
+            "cars": []
+        }
 
 
 @app.get("/proxy/stats")
@@ -1040,6 +1519,7 @@ async def test_page():
                 <h3>🆕 New Listings (Real-time)</h3>
                 <div id="messages"></div>
             </div>
+            
         </div>
 
         <script>
@@ -1164,6 +1644,7 @@ async def test_page():
                     alert('Error resetting proxies: ' + e.message);
                 }
             }
+            
         </script>
     </body>
     </html>
