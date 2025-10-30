@@ -8,3 +8,4 @@ fake-useragent==1.4.0
 asyncio-throttle==1.0.2
 python-multipart==0.0.6
 aiofiles==23.2.1
+free-proxy==1.1.1

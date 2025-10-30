@@ -48,7 +48,6 @@ class Config:
     
     # Proxy settings
     USE_PROXY_ROTATION = False  # Bật/tắt proxy rotation
-    AUTO_FETCH_FREE_PROXY = True  # Tự động lấy proxy free
     PROXY_LIST = [
         # Thêm proxy của bạn vào đây (tùy chọn)
         # "http://proxy1:port",
@@ -95,214 +94,6 @@ logger = setup_logging()
 
 
 # =============================================================================
-# FREE PROXY MANAGER
-# =============================================================================
-
-class FreeProxyManager:
-    """Quản lý việc fetch và test proxy free"""
-    
-    def __init__(self):
-        self.logger = logging.getLogger("FreeProxyManager")
-        self.last_fetch_time = None
-        self.fetched_proxies = []
-        self.proxy_cache = {}  # Cache cho proxy đã test: {proxy: (is_working, timestamp)}
-        self.cache_duration = 3600  # Cache 1 giờ
-        
-    async def fetch_proxies_from_source(self, session: aiohttp.ClientSession, source: str) -> List[str]:
-        """Fetch proxy từ một nguồn cụ thể"""
-        try:
-            self.logger.debug(f"Fetching proxies from: {source}")
-            
-            async with session.get(source, timeout=aiohttp.ClientTimeout(total=30)) as response:
-                if response.status == 200:
-                    content = await response.text()
-                    proxies = self.parse_proxy_content(content)
-                    self.logger.info(f"Fetched {len(proxies)} proxies from {source}")
-                    return proxies
-                else:
-                    self.logger.warning(f"Failed to fetch from {source}: HTTP {response.status}")
-                    return []
-        except Exception as e:
-            self.logger.error(f"Error fetching from {source}: {e}")
-            return []
-    
-    def parse_proxy_content(self, content: str) -> List[str]:
-        """Parse nội dung proxy từ các nguồn khác nhau"""
-        proxies = []
-        lines = content.strip().split('\n')
-        
-        for line in lines:
-            line = line.strip()
-            if not line:
-                continue
-                
-            # Parse các format khác nhau
-            if ':' in line:
-                parts = line.split(':')
-                if len(parts) >= 2:
-                    ip = parts[0].strip()
-                    port = parts[1].strip()
-                    
-                    # Validate IP và port
-                    if self.is_valid_ip(ip) and self.is_valid_port(port):
-                        proxy = f"http://{ip}:{port}"
-                        proxies.append(proxy)
-        
-        return proxies
-    
-    def is_valid_ip(self, ip: str) -> bool:
-        """Kiểm tra IP có hợp lệ không"""
-        try:
-            parts = ip.split('.')
-            if len(parts) != 4:
-                return False
-            
-            for part in parts:
-                if not part.isdigit() or int(part) < 0 or int(part) > 255:
-                    return False
-            
-            return True
-        except:
-            return False
-    
-    def is_valid_port(self, port: str) -> bool:
-        """Kiểm tra port có hợp lệ không"""
-        try:
-            port_num = int(port)
-            return 1 <= port_num <= 65535
-        except:
-            return False
-    
-    def is_proxy_cached(self, proxy: str) -> Optional[bool]:
-        """Kiểm tra proxy có trong cache không và còn hiệu lực không"""
-        if proxy not in self.proxy_cache:
-            return None
-        
-        is_working, timestamp = self.proxy_cache[proxy]
-        now = datetime.now().timestamp()
-        
-        # Kiểm tra cache còn hiệu lực không
-        if now - timestamp > self.cache_duration:
-            del self.proxy_cache[proxy]
-            return None
-        
-        return is_working
-    
-    def cache_proxy_result(self, proxy: str, is_working: bool):
-        """Cache kết quả test proxy"""
-        self.proxy_cache[proxy] = (is_working, datetime.now().timestamp())
-    
-    async def test_proxy(self, session: aiohttp.ClientSession, proxy: str) -> bool:
-        """Test proxy có hoạt động không"""
-        # Kiểm tra cache trước
-        cached_result = self.is_proxy_cached(proxy)
-        if cached_result is not None:
-            self.logger.debug(f"Using cached result for proxy {proxy}: {cached_result}")
-            return cached_result
-        
-        try:
-            test_url = "http://httpbin.org/ip"
-            timeout = aiohttp.ClientTimeout(total=3)  # Giảm timeout từ 10s xuống 3s
-            
-            async with session.get(test_url, proxy=proxy, timeout=timeout) as response:
-                if response.status == 200:
-                    self.cache_proxy_result(proxy, True)
-                    return True
-                else:
-                    self.cache_proxy_result(proxy, False)
-                    return False
-        except Exception as e:
-            self.logger.debug(f"Proxy test failed for {proxy}: {e}")
-            self.cache_proxy_result(proxy, False)
-            return False
-    
-    async def fetch_and_test_proxies(self) -> List[str]:
-        """Fetch và test proxy từ tất cả nguồn"""
-        if not Config.AUTO_FETCH_FREE_PROXY:
-            return []
-        
-        self.logger.info("Starting to fetch free proxies...")
-        
-        async with aiohttp.ClientSession() as session:
-            all_proxies = []
-            
-            # Fetch từ tất cả nguồn
-            for source in Config.FREE_PROXY_SOURCES:
-                proxies = await self.fetch_proxies_from_source(session, source)
-                all_proxies.extend(proxies)
-                
-                # Delay giữa các requests
-                await asyncio.sleep(random.uniform(1, 3))
-            
-            # Loại bỏ duplicate
-            unique_proxies = list(set(all_proxies))
-            self.logger.info(f"Found {len(unique_proxies)} unique proxies")
-            
-            # Test proxy và chỉ giữ lại những proxy hoạt động
-            working_proxies = []
-            
-            # Giới hạn số lượng proxy test để tăng tốc
-            max_test_proxies = min(Config.MAX_FREE_PROXIES, 50)  # Test tối đa 50 proxy
-            test_proxies = unique_proxies[:max_test_proxies]
-            
-            # Lọc proxy đã có trong cache
-            proxies_to_test = []
-            for proxy in test_proxies:
-                cached_result = self.is_proxy_cached(proxy)
-                if cached_result is not None:
-                    if cached_result:
-                        working_proxies.append(proxy)
-                        self.logger.debug(f"Using cached working proxy: {proxy}")
-                else:
-                    proxies_to_test.append(proxy)
-            
-            self.logger.info(f"Found {len(working_proxies)} cached working proxies, testing {len(proxies_to_test)} new proxies")
-            
-            if proxies_to_test:
-                # Tạo tasks để test song song với semaphore để giới hạn concurrent requests
-                semaphore = asyncio.Semaphore(15)  # Tối đa 15 proxy test cùng lúc
-                
-                async def test_proxy_with_semaphore(proxy):
-                    async with semaphore:
-                        return await self.test_proxy(session, proxy)
-                
-                # Tạo tasks để test song song
-                test_tasks = [test_proxy_with_semaphore(proxy) for proxy in proxies_to_test]
-                
-                # Chờ kết quả test với timeout
-                try:
-                    results = await asyncio.wait_for(
-                        asyncio.gather(*test_tasks, return_exceptions=True),
-                        timeout=20  # Timeout tổng cộng 20 giây
-                    )
-                    
-                    # Xử lý kết quả
-                    for i, result in enumerate(results):
-                        if isinstance(result, bool) and result:
-                            working_proxies.append(proxies_to_test[i])
-                            self.logger.debug(f"Proxy working: {proxies_to_test[i]}")
-                        elif isinstance(result, Exception):
-                            self.logger.debug(f"Error testing proxy {proxies_to_test[i]}: {result}")
-                            
-                except asyncio.TimeoutError:
-                    self.logger.warning("Proxy testing timed out, using partial results")
-                    # Lấy kết quả đã hoàn thành
-                    for i, task in enumerate(test_tasks):
-                        if task.done() and not task.cancelled():
-                            try:
-                                result = task.result()
-                                if result:
-                                    working_proxies.append(proxies_to_test[i])
-                            except Exception as e:
-                                self.logger.debug(f"Error in completed task: {e}")
-            
-            self.logger.info(f"Found {len(working_proxies)} working proxies")
-            self.last_fetch_time = datetime.now()
-            
-            return working_proxies
-
-
-# =============================================================================
 # PROXY MANAGER
 # =============================================================================
 
@@ -314,40 +105,7 @@ class ProxyManager:
         self.current_proxy_index = 0
         self.failed_proxies = set()
         self.logger = logging.getLogger("ProxyManager")
-        self.free_proxy_manager = FreeProxyManager()
         self.last_fetch_time = None
-        
-        if self.proxy_list:
-            self.logger.info(f"Initialized with {len(self.proxy_list)} manual proxies")
-        else:
-            self.logger.info("No manual proxies configured")
-        
-        # Tự động fetch proxy free nếu được bật
-        if Config.AUTO_FETCH_FREE_PROXY:
-            self.logger.info("Auto-fetch free proxies is enabled")
-    
-    def get_next_proxy(self) -> Optional[str]:
-        """Lấy proxy tiếp theo trong danh sách"""
-        if not self.proxy_list:
-            return None
-        
-        # Lọc bỏ các proxy đã fail
-        available_proxies = [p for p in self.proxy_list if p not in self.failed_proxies]
-        
-        if not available_proxies:
-            # Reset failed proxies nếu tất cả đều fail
-            self.logger.warning("All proxies failed, resetting failed list")
-            self.failed_proxies.clear()
-            available_proxies = self.proxy_list
-        
-        if not available_proxies:
-            return None
-        
-        # Lấy proxy tiếp theo
-        proxy = available_proxies[self.current_proxy_index % len(available_proxies)]
-        self.current_proxy_index += 1
-        
-        return proxy
     
     def get_random_proxy(self) -> Optional[str]:
         """Lấy proxy ngẫu nhiên"""
@@ -365,12 +123,6 @@ class ProxyManager:
         
         return random.choice(available_proxies)
     
-    def mark_proxy_failed(self, proxy: str):
-        """Đánh dấu proxy bị lỗi"""
-        if proxy:
-            self.failed_proxies.add(proxy)
-            self.logger.warning(f"Marked proxy as failed: {proxy}")
-    
     def is_proxy_available(self) -> bool:
         """Kiểm tra có proxy nào khả dụng không"""
         if not self.proxy_list:
@@ -379,45 +131,64 @@ class ProxyManager:
         available_proxies = [p for p in self.proxy_list if p not in self.failed_proxies]
         return len(available_proxies) > 0
     
-    async def fetch_free_proxies(self) -> List[str]:
-        """Fetch proxy free từ các nguồn"""
-        if not Config.AUTO_FETCH_FREE_PROXY:
-            return []
-        
-        # Kiểm tra thời gian fetch cuối cùng
-        now = datetime.now()
-        if (self.last_fetch_time and 
-            (now - self.last_fetch_time).total_seconds() < Config.PROXY_FETCH_INTERVAL):
-            return []
-        
-        self.logger.info("Fetching free proxies...")
-        free_proxies = await self.free_proxy_manager.fetch_and_test_proxies()
-        
-        if free_proxies:
-            # Thêm proxy free vào danh sách
-            self.proxy_list.extend(free_proxies)
-            # Loại bỏ duplicate
-            self.proxy_list = list(set(self.proxy_list))
-            self.last_fetch_time = now
-            
-            self.logger.info(f"Added {len(free_proxies)} free proxies. Total proxies: {len(self.proxy_list)}")
-        
-        return free_proxies
+    def _parse_proxy_ip(self, proxy: str) -> str:
+        """Parse IP/host từ proxy URL"""
+        try:
+            parsed = urlparse(proxy)
+            if parsed.hostname:
+                return parsed.hostname
+            elif '@' in parsed.netloc:
+                return parsed.netloc.split('@')[-1].split(':')[0]
+            else:
+                return parsed.netloc.split(':')[0]
+        except:
+            try:
+                if '@' in proxy:
+                    return proxy.split('@')[-1].split(':')[0]
+                else:
+                    return proxy.split('://')[-1].split(':')[0]
+            except:
+                return proxy
     
-    def get_stats(self) -> Dict[str, Any]:
-        """Lấy thống kê proxy"""
-        return {
-            "total_proxies": len(self.proxy_list),
-            "available_proxies": len([p for p in self.proxy_list if p not in self.failed_proxies]),
-            "failed_proxies": len(self.failed_proxies),
-            "current_index": self.current_proxy_index,
-            "proxy_rotation_enabled": Config.USE_PROXY_ROTATION,
-            "auto_fetch_enabled": Config.AUTO_FETCH_FREE_PROXY,
-            "last_fetch_time": self.last_fetch_time.isoformat() if self.last_fetch_time else None,
-            "manual_proxies": len([p for p in Config.PROXY_LIST if p.strip()]),
-            "free_proxies": len(self.proxy_list) - len([p for p in Config.PROXY_LIST if p.strip()])
-        }
-
+    def mark_proxy_failed(self, proxy: str):
+        """Đánh dấu proxy bị lỗi và xóa khỏi cache"""
+        if proxy:
+            self.failed_proxies.add(proxy)
+    
+    def get_free_proxy_from_library(self) -> Optional[str]:
+        """Lấy proxy free từ thư viện free-proxy"""
+        try:
+            try:
+                from fp.fp import FreeProxy
+            except ImportError:
+                from fp import FreeProxy
+            
+            # Kiểm tra cache và lọc bỏ proxy đã fail
+            now = datetime.now()
+            
+            # Lấy proxy mới từ thư viện
+            self.logger.debug("Fetching new free proxy from library...")
+            proxy = FreeProxy(url='https://www.willhaben.at/iad/gebrauchtwagen/auto/gebrauchtwagenboerse',timeout=0.1)
+            proxy_str = proxy.get()
+            
+            if proxy_str:
+                # Format: http://ip:port
+                if not proxy_str.startswith('http'):
+                    proxy_str = f"http://{proxy_str}"
+                
+                proxy_ip = self._parse_proxy_ip(proxy_str)
+                self.logger.info(f"Got new free proxy from library - IP: {proxy_ip} | URL: {proxy_str}")
+                return proxy_str
+            else:
+                self.logger.warning("No proxy available from free-proxy library")
+                return None
+                
+        except ImportError:
+            self.logger.error("free-proxy library not installed. Install with: pip install free-proxy")
+            return None
+        except Exception as e:
+            self.logger.error(f"Error getting free proxy from library: {e}")
+            return None
 
 # =============================================================================
 # WEBSOCKET MANAGER
@@ -434,13 +205,11 @@ class WebSocketManager:
         """Kết nối WebSocket mới"""
         await websocket.accept()
         self.active_connections.append(websocket)
-        self.logger.info(f"WebSocket connected. Total connections: {len(self.active_connections)}")
     
     def disconnect(self, websocket: WebSocket):
         """Ngắt kết nối WebSocket"""
         if websocket in self.active_connections:
             self.active_connections.remove(websocket)
-        self.logger.info(f"WebSocket disconnected. Total connections: {len(self.active_connections)}")
     
     async def send_personal_message(self, message: str, websocket: WebSocket):
         """Gửi tin nhắn đến một WebSocket cụ thể"""
@@ -453,9 +222,18 @@ class WebSocketManager:
     async def broadcast(self, message: Dict[str, Any]):
         """Gửi tin nhắn đến tất cả WebSocket đang kết nối"""
         if not self.active_connections:
+            self.logger.warning("No active WebSocket connections to broadcast to")
             return
         
-        message_str = json.dumps(message, ensure_ascii=False)
+        try:
+            message_str = json.dumps(message, ensure_ascii=False)
+            message_type = message.get('type', 'unknown')
+            message_count = message.get('count', 0) if 'count' in message else (len(message.get('data', [])) if 'data' in message else 0)
+            # self.logger.info(f"Broadcasting {message_type} to {len(self.active_connections)} connection(s) with {message_count} items")
+        except Exception as e:
+            self.logger.error(f"Error serializing broadcast message: {e}")
+            return
+        
         disconnected = []
         
         for connection in self.active_connections:
@@ -469,8 +247,9 @@ class WebSocketManager:
         for connection in disconnected:
             self.disconnect(connection)
         
-        if self.active_connections:
-            self.logger.info(f"Broadcasted message to {len(self.active_connections)} connections")
+        if disconnected:
+            self.logger.info(f"Removed {len(disconnected)} disconnected connections")
+        
 
 
 # =============================================================================
@@ -484,21 +263,14 @@ class WillhabenCrawler:
         self.websocket_manager = websocket_manager
         self.proxy_manager = ProxyManager()
         self.seen_ids: Set[str] = set()
+        self.all_listings: List[Dict[str, Any]] = []  # Lưu trữ tất cả listings đã crawl
+        self.new_listings_array: List[Dict[str, Any]] = []  # Array lưu new_listings để broadcast
         self.total_crawled = 0
         self.session: Optional[aiohttp.ClientSession] = None
         self.user_agent = UserAgent()
         self.logger = logging.getLogger("WillhabenCrawler")
         self.is_running = False
-        
-        # Thống kê
-        self.stats = {
-            "total_requests": 0,
-            "successful_requests": 0,
-            "failed_requests": 0,
-            "new_items_found": 0,
-            "last_crawl_time": None,
-            "start_time": datetime.now()
-        }
+        self.max_new_listings = 1000  # Giới hạn số lượng new_listings
     
     async def create_session(self):
         """Tạo aiohttp session với cấu hình"""
@@ -536,44 +308,59 @@ class WillhabenCrawler:
         }
         return headers
     
-    async def fetch_page(self, url: str) -> Optional[str]:
+    async def fetch_page(self, url: str,useProxy: bool = True) -> Optional[str]:
         """Fetch một trang web với proxy rotation"""
         if not self.session:
             await self.create_session()
         
         headers = self.get_random_headers()
         
-        # Lấy proxy nếu có
         proxy = None
+        
         if Config.USE_PROXY_ROTATION and self.proxy_manager.is_proxy_available():
             proxy = self.proxy_manager.get_random_proxy()
             if proxy:
-                self.logger.debug(f"Using proxy: {proxy}")
+                proxy_ip = self.proxy_manager._parse_proxy_ip(proxy)
+                self.logger.info(f"Fetching data using Proxy IP: {proxy_ip} | Proxy URL: {proxy}")
+        elif useProxy:
+            # Dùng thư viện free-proxy để lấy proxy
+            proxy = self.proxy_manager.get_free_proxy_from_library()
+            if proxy:
+                proxy_ip = self.proxy_manager._parse_proxy_ip(proxy)
+                self.logger.info(f"Fetching data using Free Proxy IP: {proxy_ip} | Proxy URL: {proxy}")
         
         try:
-            self.stats["total_requests"] += 1
             
             # Tạo timeout riêng cho proxy
             timeout = aiohttp.ClientTimeout(total=Config.PROXY_TIMEOUT if proxy else Config.REQUEST_TIMEOUT)
             
             async with self.session.get(url, headers=headers, proxy=proxy, timeout=timeout) as response:
                 if response.status == 200:
-                    self.stats["successful_requests"] += 1
                     content = await response.text()
-                    self.logger.debug(f"Successfully fetched {url} via {proxy or 'direct'}")
+                    if proxy:
+                        proxy_ip = self.proxy_manager._parse_proxy_ip(proxy)
+                        self.logger.info(f"Successfully fetched data via Proxy IP: {proxy_ip} | URL: {url}")
+                    else:
+                        self.logger.debug(f"Successfully fetched {url} via direct connection")
                     return content
                 else:
-                    self.stats["failed_requests"] += 1
-                    self.logger.warning(f"HTTP {response.status} for {url} via {proxy or 'direct'}")
+                    if proxy:
+                        proxy_ip = self.proxy_manager._parse_proxy_ip(proxy)
+                        self.logger.warning(f"HTTP {response.status} for {url} via Proxy IP: {proxy_ip}")
+                    else:
+                        self.logger.warning(f"HTTP {response.status} for {url} via direct connection")
                     
                     # Đánh dấu proxy fail nếu có lỗi
                     if proxy and response.status in [403, 407, 502, 503]:
                         self.proxy_manager.mark_proxy_failed(proxy)
                     
-                    return None
+                    return self.fetch_page(url,useProxy=False)
         except Exception as e:
-            self.stats["failed_requests"] += 1
-            self.logger.error(f"Error fetching {url} via {proxy or 'direct'}: {e}")
+            if proxy:
+                proxy_ip = self.proxy_manager._parse_proxy_ip(proxy)
+                self.logger.error(f"Error fetching {url} via Proxy IP: {proxy_ip} | Error: {e}")
+            else:
+                self.logger.error(f"Error fetching {url} via direct connection: {e}")
             
             # Đánh dấu proxy fail nếu có exception
             if proxy:
@@ -601,7 +388,6 @@ class WillhabenCrawler:
                     keyword in x.lower() for keyword in ['item', 'listing', 'ad', 'result']
                 ))
             
-            self.logger.info(f"Found {len(car_containers)} potential car listings")
             
             for container in car_containers:
                 try:
@@ -636,7 +422,6 @@ class WillhabenCrawler:
             # Trích xuất dữ liệu xe từ advertSummaryList
             try:
                 advert_summary_list = json_data['props']['pageProps']['searchResult']['advertSummaryList']['advertSummary']
-                self.logger.info(f"Tìm thấy {len(advert_summary_list)} xe trong __NEXT_DATA__")
                 
                 for advert in advert_summary_list:
                     try:
@@ -684,7 +469,6 @@ class WillhabenCrawler:
             with open(log_filename, 'w', encoding='utf-8') as f:
                 json.dump(log_data, f, ensure_ascii=False, indent=2)
             
-            self.logger.info(f"Đã ghi advert {advert_id} vào file: {log_filename}")
             
             # Cập nhật file tổng hợp
             self.update_summary_log(advert_id, car_model)
@@ -980,10 +764,36 @@ class WillhabenCrawler:
             if 'advertImageList' in advert and 'advertImage' in advert['advertImageList']:
                 images = advert['advertImageList']['advertImage']
                 if images:
-                    car_model['images']['main_image'] = images[0].get('mainImageUrl', '')
-                    car_model['images']['thumbnail'] = images[0].get('thumbnailImageUrl', '')
-                    car_model['images']['all_images'] = [img.get('mainImageUrl', '') for img in images]
-                    car_model['images']['image_count'] = len(images)
+                    # Kiểm tra nếu images là list hoặc dict
+                    if isinstance(images, list):
+                        if len(images) > 0:
+                            first_image = images[0]
+                            if isinstance(first_image, dict):
+                                car_model['images']['main_image'] = first_image.get('mainImageUrl', first_image.get('href', ''))
+                                car_model['images']['thumbnail'] = first_image.get('thumbnailImageUrl', first_image.get('mainImageUrl', first_image.get('href', '')))
+                                car_model['images']['all_images'] = [img.get('mainImageUrl', img.get('href', '')) for img in images if isinstance(img, dict)]
+                            else:
+                                car_model['images']['main_image'] = str(first_image)
+                                car_model['images']['thumbnail'] = str(first_image)
+                    elif isinstance(images, dict):
+                        car_model['images']['main_image'] = images.get('mainImageUrl', images.get('href', ''))
+                        car_model['images']['thumbnail'] = images.get('thumbnailImageUrl', images.get('mainImageUrl', images.get('href', '')))
+                    car_model['images']['image_count'] = len(images) if isinstance(images, list) else 1
+            
+            # Nếu không có ảnh từ advertImageList, thử tìm trong các field khác
+            if not car_model['images']['main_image']:
+                # Thử tìm trong attributes
+                if 'attributes' in advert and advert['attributes']:
+                    attributes = advert['attributes'].get('attribute', [])
+                    for attr in attributes:
+                        if 'name' in attr and 'values' in attr and attr['values']:
+                            attr_name = attr['name']
+                            if 'IMAGE' in attr_name.upper() or 'PHOTO' in attr_name.upper() or 'PICTURE' in attr_name.upper():
+                                attr_value = attr['values'][0] if attr['values'] else ''
+                                if attr_value:
+                                    car_model['images']['main_image'] = attr_value
+                                    car_model['images']['thumbnail'] = attr_value
+                                    break
             
             return car_model
             
@@ -1053,11 +863,8 @@ class WillhabenCrawler:
     
     async def crawl_once(self) -> List[Dict[str, Any]]:
         """Thực hiện một lần crawl"""
-        self.logger.info("Starting crawl cycle...")
-        
         html = await self.fetch_page(Config.BASE_URL)
         if not html:
-            self.logger.warning("Failed to fetch page")
             return []
         
         # Thử parse từ __NEXT_DATA__ trước (phương pháp mới)
@@ -1065,10 +872,7 @@ class WillhabenCrawler:
         
         # Nếu không có dữ liệu từ __NEXT_DATA__, fallback về phương pháp cũ
         if not listings:
-            self.logger.info("No data from __NEXT_DATA__, trying fallback method...")
             listings = self.parse_car_listings(html)
-        
-        self.logger.info(f"Parsed {len(listings)} listings")
         
         # Phát hiện tin mới
         new_listings = []
@@ -1076,7 +880,11 @@ class WillhabenCrawler:
             if listing['id'] not in self.seen_ids:
                 self.seen_ids.add(listing['id'])
                 new_listings.append(listing)
-                self.stats["new_items_found"] += 1
+                # Thêm vào đầu danh sách all_listings (item mới nhất ở đầu)
+                self.all_listings.insert(0, listing)
+                # Giới hạn số lượng listings để tránh tốn bộ nhớ (giữ lại 1000 item mới nhất)
+                if len(self.all_listings) > 1000:
+                    self.all_listings = self.all_listings[:1000]
                 # Log thông tin chi tiết hơn
                 car_info = listing.get('car_info', {})
                 pricing = listing.get('pricing', {})
@@ -1084,47 +892,44 @@ class WillhabenCrawler:
                 make = car_info.get('make', 'N/A')
                 model = car_info.get('model', 'N/A')
                 year = car_info.get('year', 'N/A')
-                self.logger.info(f"New listing found: {make} {model} ({year}) - {price_display}")
+                # self.logger.info(f"New listing found: {make} {model} ({year}) - {price_display}")
         
         self.total_crawled += len(listings)
-        self.stats["last_crawl_time"] = datetime.now()
         
         return new_listings
     
     async def crawl_loop(self):
         """Vòng lặp crawl chính"""
         self.is_running = True
-        self.logger.info("Starting crawler loop...")
-        
-        # Fetch proxy free lần đầu
-        if Config.AUTO_FETCH_FREE_PROXY:
-            await self.proxy_manager.fetch_free_proxies()
         
         while self.is_running:
             try:
-                start_time = time.time()
-                
-                # Fetch proxy free định kỳ
-                if Config.AUTO_FETCH_FREE_PROXY:
-                    await self.proxy_manager.fetch_free_proxies()
-                
                 # Thực hiện crawl
                 new_listings = await self.crawl_once()
                 
-                # Gửi tin mới qua WebSocket
+                # Cập nhật new_listings array nếu có listing mới
                 if new_listings:
-                    for listing in new_listings:
-                        # Chuyển đổi car_model thành format đơn giản cho WebSocket
-                        websocket_data = self.convert_car_model_for_websocket(listing)
-                        await self.websocket_manager.broadcast({
-                            'type': 'new_listing',
-                            'data': websocket_data,
-                            'timestamp': datetime.now().isoformat()
-                        })
-                
-                # Tính thời gian crawl
-                crawl_time = time.time() - start_time
-                self.logger.info(f"Crawl completed in {crawl_time:.2f}s. Found {len(new_listings)} new listings")
+                    self.update_new_listings_array(new_listings)
+                    
+                    # Log thông tin của new_listings_array
+                    if self.new_listings_array:
+                        self.logger.info(f"new_listings_array hiện có {len(self.new_listings_array)} items:")
+                        for i, item in enumerate(self.new_listings_array[:10], 1):  # Log 10 items đầu tiên
+                            item_id = item.get('id', 'N/A')
+                            item_title = item.get('title', 'N/A')
+                            self.logger.info(f"  [{i}] ID: {item_id} | Title: {item_title}")
+                        if len(self.new_listings_array) > 10:
+                            self.logger.info(f"  ... và {len(self.new_listings_array) - 10} items khác")
+                    
+                    # Broadcast toàn bộ array cho WebSocket
+                    broadcast_data = {
+                        'type': 'new_listings_update',
+                        'data': self.new_listings_array,
+                        'timestamp': datetime.now().isoformat(),
+                        'count': len(self.new_listings_array)
+                    }
+                    # self.logger.info(f"Broadcasting new_listings_update with {len(self.new_listings_array)} items")
+                    await self.websocket_manager.broadcast(broadcast_data)
                 
                 # Random delay để tránh bị chặn
                 delay = random.uniform(Config.MIN_DELAY, Config.MAX_DELAY)
@@ -1134,10 +939,40 @@ class WillhabenCrawler:
                 self.logger.error(f"Error in crawl loop: {e}")
                 await asyncio.sleep(Config.CRAWL_INTERVAL)
     
+    def update_new_listings_array(self, new_listings: List[Dict[str, Any]]):
+        """Cập nhật new_listings array: thêm mới vào đầu, loại bỏ duplicate dựa trên ID"""
+        if not new_listings:
+            return
+        
+        # Lấy danh sách ID hiện tại để kiểm tra duplicate
+        existing_ids = {listing.get('id', '') for listing in self.new_listings_array}
+        
+        # Convert các listing mới và thêm vào đầu danh sách
+        for listing in new_listings:
+            listing_id = listing.get('id', '')
+            
+            # Kiểm tra nếu ID đã tồn tại, loại bỏ item cũ
+            if listing_id and listing_id in existing_ids:
+                # Remove item cũ có cùng ID
+                self.new_listings_array = [
+                    item for item in self.new_listings_array 
+                    if item.get('id', '') != listing_id
+                ]
+            
+            # Convert listing sang format WebSocket
+            websocket_data = self.convert_car_model_for_websocket(listing)
+            
+            # Thêm vào đầu danh sách
+            self.new_listings_array.insert(0, websocket_data)
+            existing_ids.add(listing_id)
+        
+        # Giới hạn số lượng để tránh tốn bộ nhớ
+        if len(self.new_listings_array) > self.max_new_listings:
+            self.new_listings_array = self.new_listings_array[:self.max_new_listings]
+    
     def stop(self):
         """Dừng crawler"""
         self.is_running = False
-        self.logger.info("Crawler stopped")
     
     def convert_car_model_for_websocket(self, car_model: Dict[str, Any]) -> Dict[str, Any]:
         """Chuyển đổi car_model phức tạp thành format đơn giản cho WebSocket"""
@@ -1149,6 +984,27 @@ class WillhabenCrawler:
             seller = car_model.get('seller', {})
             images = car_model.get('images', {})
             timing = car_model.get('timing', {})
+            
+            # Lấy ảnh với nhiều fallback
+            image_url = images.get('main_image', '') or images.get('thumbnail', '')
+            if not image_url and 'all_images' in images and len(images['all_images']) > 0:
+                image_url = images['all_images'][0]
+            
+            # Xử lý crawled_at - đảm bảo là string
+            crawled_at = car_model.get('crawled_at', '')
+            if crawled_at:
+                if isinstance(crawled_at, datetime):
+                    crawled_at = crawled_at.isoformat()
+                elif not isinstance(crawled_at, str):
+                    crawled_at = str(crawled_at)
+            
+            # Xử lý last_updated - đảm bảo là string
+            last_updated = timing.get('last_updated', '')
+            if last_updated:
+                if isinstance(last_updated, datetime):
+                    last_updated = last_updated.isoformat()
+                elif not isinstance(last_updated, str):
+                    last_updated = str(last_updated)
             
             return {
                 'id': car_model.get('id', ''),
@@ -1162,11 +1018,11 @@ class WillhabenCrawler:
                 'location': location.get('city', location.get('address', '')),
                 'seller': seller.get('org_name', ''),
                 'url': car_model.get('url', ''),
-                'image_url': images.get('main_image', images.get('thumbnail', '')),
-                'crawled_at': car_model.get('crawled_at', ''),
+                'image_url': image_url,
+                'crawled_at': crawled_at,
                 'source': 'willhaben.at',
                 'transmission': car_info.get('transmission_resolved', car_info.get('transmission', '')),
-                'last_updated': timing.get('last_updated', '')
+                'last_updated': last_updated
             }
         except Exception as e:
             self.logger.error(f"Lỗi khi convert car_model cho WebSocket: {e}")
@@ -1189,22 +1045,6 @@ class WillhabenCrawler:
                 'transmission': 'N/A',
                 'last_updated': ''
             }
-    
-    def get_stats(self) -> Dict[str, Any]:
-        """Lấy thống kê crawler"""
-        uptime = datetime.now() - self.stats["start_time"]
-        proxy_stats = self.proxy_manager.get_stats()
-        
-        return {
-            "is_running": self.is_running,
-            "total_crawled": self.total_crawled,
-            "seen_ids_count": len(self.seen_ids),
-            "uptime_seconds": uptime.total_seconds(),
-            "stats": self.stats,
-            "proxy_stats": proxy_stats,
-            "cars_crawled": len(self.seen_ids),
-            "last_crawl_time": self.stats["last_crawl_time"].isoformat() if self.stats["last_crawl_time"] else None
-        }
 
 
 # =============================================================================
@@ -1226,29 +1066,21 @@ crawler = WillhabenCrawler(websocket_manager)
 @app.on_event("startup")
 async def startup_event():
     """Khởi tạo khi ứng dụng bắt đầu"""
-    logger.info("Starting Willhaben Crawler Backend...")
-    
     # Tạo crawler session
     await crawler.create_session()
     
     # Bắt đầu crawler loop
     asyncio.create_task(crawler.crawl_loop())
-    
-    logger.info("Backend started successfully!")
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
     """Dọn dẹp khi ứng dụng tắt"""
-    logger.info("Shutting down...")
-    
     # Dừng crawler
     crawler.stop()
     
     # Đóng session
     await crawler.close_session()
-    
-    logger.info("Backend stopped!")
 
 
 @app.get("/")
@@ -1259,181 +1091,10 @@ async def root():
         "version": "1.0.0",
         "status": "running",
         "endpoints": {
-            "health": "/health",
             "test": "/test",
             "websocket": "/ws"
         }
     }
-
-
-@app.get("/health")
-async def health():
-    """Endpoint health check"""
-    stats = crawler.get_stats()
-    proxy_stats = stats["proxy_stats"]
-    
-    return {
-        "status": "healthy",
-        "crawler_running": crawler.is_running,
-        "total_seen_items": len(crawler.seen_ids),
-        "total_crawled": crawler.total_crawled,
-        "cars_crawled": stats["cars_crawled"],
-        "new_items_found": stats["stats"]["new_items_found"],
-        "uptime_seconds": stats["uptime_seconds"],
-        "last_crawl_time": stats["last_crawl_time"],
-        "websocket_connections": len(websocket_manager.active_connections),
-        "proxy_rotation": {
-            "enabled": proxy_stats["proxy_rotation_enabled"],
-            "total_proxies": proxy_stats["total_proxies"],
-            "available_proxies": proxy_stats["available_proxies"],
-            "failed_proxies": proxy_stats["failed_proxies"]
-        }
-    }
-
-
-@app.get("/cars")
-async def get_cars():
-    """Lấy danh sách xe đã crawl"""
-    return {
-        "total_cars": len(crawler.seen_ids),
-        "cars": list(crawler.seen_ids),
-        "last_crawl_time": crawler.get_stats()["last_crawl_time"]
-    }
-
-
-@app.get("/cars/detailed")
-async def get_cars_detailed(sort_by: str = "last_updated", limit: int = 100):
-    """Lấy danh sách xe chi tiết với khả năng sort"""
-    try:
-        import os
-        import json
-        from datetime import datetime
-        
-        logs_dir = "logs"
-        if not os.path.exists(logs_dir):
-            return {
-                "total_cars": 0,
-                "cars": [],
-                "message": "No logs directory found"
-            }
-        
-        # Lấy danh sách tất cả file advert
-        advert_files = [f for f in os.listdir(logs_dir) if f.startswith("advert_") and f.endswith(".json")]
-        
-        cars_data = []
-        
-        for file_name in advert_files:
-            try:
-                file_path = os.path.join(logs_dir, file_name)
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                
-                if 'car_model' in data:
-                    car_model = data['car_model']
-                    
-                    # Thêm thông tin sorting
-                    car_info = {
-                        'id': car_model.get('id', ''),
-                        'title': car_model.get('title', ''),
-                        'make': car_model.get('car_info', {}).get('make', ''),
-                        'model': car_model.get('car_info', {}).get('model', ''),
-                        'year': car_model.get('car_info', {}).get('year', ''),
-                        'mileage': car_model.get('car_info', {}).get('mileage', ''),
-                        'fuel_type': car_model.get('car_info', {}).get('fuel_type_resolved', ''),
-                        'transmission': car_model.get('car_info', {}).get('transmission_resolved', ''),
-                        'price': car_model.get('pricing', {}).get('price_display', ''),
-                        'price_amount': car_model.get('pricing', {}).get('price_amount', ''),
-                        'location': car_model.get('location', {}).get('city', ''),
-                        'seller': car_model.get('seller', {}).get('org_name', ''),
-                        'url': car_model.get('url', ''),
-                        'main_image': car_model.get('images', {}).get('main_image', ''),
-                        'thumbnail': car_model.get('images', {}).get('thumbnail', ''),
-                        'image_count': car_model.get('images', {}).get('image_count', 0),
-                        'last_updated': car_model.get('timing', {}).get('last_updated', ''),
-                        'published': car_model.get('timing', {}).get('published_string', ''),
-                        'crawled_at': car_model.get('crawled_at', ''),
-                        'is_private': car_model.get('pricing', {}).get('is_private', False),
-                        'warranty': car_model.get('car_info', {}).get('warranty_resolved', ''),
-                        'equipment_count': len(car_model.get('equipment', {}).get('equipment_resolved', []))
-                    }
-                    
-                    cars_data.append(car_info)
-                    
-            except Exception as e:
-                continue
-        
-        # Sort theo last_updated (mặc định) hoặc các trường khác
-        if sort_by == "last_updated":
-            cars_data.sort(key=lambda x: x.get('last_updated', ''), reverse=True)
-        elif sort_by == "published":
-            cars_data.sort(key=lambda x: x.get('published', ''), reverse=True)
-        elif sort_by == "crawled_at":
-            cars_data.sort(key=lambda x: x.get('crawled_at', ''), reverse=True)
-        elif sort_by == "price_amount":
-            cars_data.sort(key=lambda x: float(x.get('price_amount', 0)) if x.get('price_amount', '').replace('.', '').isdigit() else 0, reverse=True)
-        elif sort_by == "year":
-            cars_data.sort(key=lambda x: int(x.get('year', 0)) if x.get('year', '').isdigit() else 0, reverse=True)
-        elif sort_by == "mileage":
-            cars_data.sort(key=lambda x: int(x.get('mileage', 0)) if x.get('mileage', '').replace(',', '').isdigit() else 0)
-        
-        # Giới hạn số lượng kết quả
-        if limit > 0:
-            cars_data = cars_data[:limit]
-        
-        return {
-            "total_cars": len(cars_data),
-            "cars": cars_data,
-            "sort_by": sort_by,
-            "limit": limit,
-            "last_crawl_time": crawler.get_stats()["last_crawl_time"]
-        }
-        
-    except Exception as e:
-        return {
-            "error": f"Error getting detailed cars: {str(e)}",
-            "total_cars": 0,
-            "cars": []
-        }
-
-
-@app.get("/proxy/stats")
-async def proxy_stats():
-    """Lấy thống kê proxy"""
-    return crawler.proxy_manager.get_stats()
-
-
-@app.post("/proxy/reset")
-async def reset_failed_proxies():
-    """Reset danh sách proxy bị lỗi"""
-    crawler.proxy_manager.failed_proxies.clear()
-    return {"message": "Failed proxies reset successfully"}
-
-
-@app.post("/proxy/fetch")
-async def fetch_free_proxies():
-    """Fetch proxy free thủ công"""
-    try:
-        free_proxies = await crawler.proxy_manager.fetch_free_proxies()
-        return {
-            "message": f"Successfully fetched {len(free_proxies)} free proxies",
-            "new_proxies": len(free_proxies),
-            "total_proxies": len(crawler.proxy_manager.proxy_list)
-        }
-    except Exception as e:
-        return {"error": f"Failed to fetch proxies: {str(e)}"}
-
-
-@app.get("/proxy/list")
-async def list_proxies():
-    """Xem danh sách proxy hiện tại"""
-    return {
-        "total_proxies": len(crawler.proxy_manager.proxy_list),
-        "available_proxies": len([p for p in crawler.proxy_manager.proxy_list if p not in crawler.proxy_manager.failed_proxies]),
-        "failed_proxies": len(crawler.proxy_manager.failed_proxies),
-        "proxy_list": crawler.proxy_manager.proxy_list[:10],  # Chỉ hiển thị 10 proxy đầu
-        "failed_list": list(crawler.proxy_manager.failed_proxies)[:10]  # Chỉ hiển thị 10 proxy fail đầu
-    }
-
 
 @app.get("/test", response_class=HTMLResponse)
 async def test_page():
@@ -1480,6 +1141,17 @@ async def test_page():
             .listing .link { color: #007bff; text-decoration: none; }
             .listing .link:hover { text-decoration: underline; }
             .timestamp { font-size: 12px; color: #999; }
+            .listing-image {
+                width: 150px;
+                height: 100px;
+                object-fit: cover;
+                border-radius: 4px;
+                margin-right: 15px;
+                float: left;
+            }
+            .listing-content {
+                overflow: hidden;
+            }
             #messages {
                 max-height: 600px;
                 overflow-y: auto;
@@ -1498,25 +1170,11 @@ async def test_page():
             </div>
             
             <div>
-                <h3>📊 Statistics</h3>
-                <p>Total items seen: <span id="total-items">0</span></p>
-                <p>Cars crawled: <span id="cars-crawled">0</span></p>
-                <p>New items found: <span id="new-items">0</span></p>
-                <p>Last update: <span id="last-update">Never</span></p>
-                
-                <h4>🔄 Proxy Status</h4>
-                <p>Proxy Rotation: <span id="proxy-enabled">Disabled</span></p>
-                <p>Available Proxies: <span id="proxy-available">0</span></p>
-                <p>Failed Proxies: <span id="proxy-failed">0</span></p>
-                <p>Auto Fetch: <span id="proxy-auto-fetch">Disabled</span></p>
-                <p>Free Proxies: <span id="proxy-free">0</span></p>
-                <p>Manual Proxies: <span id="proxy-manual">0</span></p>
-                <button onclick="fetchProxies()" style="margin: 5px; padding: 5px 10px;">Fetch Free Proxies</button>
-                <button onclick="resetProxies()" style="margin: 5px; padding: 5px 10px;">Reset Failed</button>
-            </div>
-            
-            <div>
                 <h3>🆕 New Listings (Real-time)</h3>
+                <div style="margin-bottom: 10px;">
+                    <strong>New Items Count:</strong> <span id="new-items">0</span> | 
+                    <strong>Last Update:</strong> <span id="last-update">Never</span>
+                </div>
                 <div id="messages"></div>
             </div>
             
@@ -1542,11 +1200,27 @@ async def test_page():
                 ws.onmessage = function(event) {
                     try {
                         const data = JSON.parse(event.data);
-                        if (data.type === 'new_listing') {
-                            addNewListing(data.data);
-                            newItems++;
-                            document.getElementById('new-items').textContent = newItems;
-                            document.getElementById('last-update').textContent = new Date().toLocaleTimeString();
+                        if (data.type === 'welcome') {
+                            console.log('Welcome message:', data.message);
+                        } else if (data.type === 'initial_listings' || data.type === 'new_listings_update') {
+                            // Nhận array và hiển thị trực tiếp
+                            if (data.data && Array.isArray(data.data)) {
+                                console.log(`Received ${data.type}: ${data.data.length} items`);
+                                displayListings(data.data);
+                            } else {
+                                console.warn('Invalid data format:', data);
+                            }
+                            newItems = data.count || (data.data ? data.data.length : 0);
+                            const newItemsEl = document.getElementById('new-items');
+                            if (newItemsEl) {
+                                newItemsEl.textContent = newItems;
+                            }
+                            if (data.type === 'new_listings_update') {
+                                const lastUpdateEl = document.getElementById('last-update');
+                                if (lastUpdateEl) {
+                                    lastUpdateEl.textContent = new Date().toLocaleTimeString();
+                                }
+                            }
                         }
                     } catch (e) {
                         console.error('Error parsing message:', e);
@@ -1567,83 +1241,73 @@ async def test_page():
                 };
             }
 
-            function addNewListing(listing) {
+            function displayListings(listings) {
                 const messagesDiv = document.getElementById('messages');
-                const listingDiv = document.createElement('div');
-                listingDiv.className = 'listing';
                 
-                listingDiv.innerHTML = `
-                    <h3>${listing.title || 'N/A'}</h3>
-                    <div class="price">${listing.price || 'N/A'}</div>
-                    <div class="details">
-                        <strong>ID:</strong> ${listing.id || 'N/A'} | 
-                        <strong>Year:</strong> ${listing.year || 'N/A'} | 
-                        <strong>Mileage:</strong> ${listing.mileage || 'N/A'} | 
-                        <strong>Fuel:</strong> ${listing.fuel || 'N/A'}
-                    </div>
-                    <div class="details">
-                        <strong>Brand:</strong> ${listing.brand || 'N/A'} | 
-                        <strong>Model:</strong> ${listing.model || 'N/A'} | 
-                        <strong>Location:</strong> ${listing.location || 'N/A'}
-                    </div>
-                    ${listing.url ? `<a href="${listing.url}" target="_blank" class="link">View Details</a>` : ''}
-                    <div class="timestamp">Found at: ${new Date(listing.crawled_at).toLocaleString()}</div>
-                `;
+                if (!listings || !Array.isArray(listings) || listings.length === 0) {
+                    console.warn('displayListings: Invalid or empty listings array');
+                    return;
+                }
                 
-                messagesDiv.insertBefore(listingDiv, messagesDiv.firstChild);
+                console.log(`displayListings: Rendering ${listings.length} listings`);
                 
-                // Giới hạn số lượng tin hiển thị
+                // Xóa danh sách cũ
+                messagesDiv.innerHTML = '';
+                
+                // listings từ server có mới nhất ở đầu (index 0)
+                // Để hiển thị cũ nhất ở trên, mới nhất ở dưới:
+                // Duyệt từ cuối array về đầu và thêm vào đầu DOM
+                for (let i = listings.length - 1; i >= 0 ; i--) {
+                    const listing = listings[i];
+                    if (!listing || !listing.id) {
+                        console.warn('Skipping invalid listing:', listing);
+                        continue;
+                    }
+                    
+                    const listingDiv = document.createElement('div');
+                    listingDiv.className = 'listing';
+                    listingDiv.setAttribute('data-id', listing.id); // Để debug dễ hơn
+                    
+                    // Tạo HTML cho ảnh
+                    const imageHtml = listing.image_url ? 
+                        `<img src="${listing.image_url}" alt="${listing.title || 'Car'}" class="listing-image" onerror="this.style.display='none'">` : 
+                        '';
+                    
+                    listingDiv.innerHTML = `
+                        ${imageHtml}
+                        <div class="listing-content">
+                            <h3>${listing.title || 'N/A'}</h3>
+                            <div class="price">${listing.price || 'N/A'}</div>
+                            <div class="details">
+                                <strong>ID:</strong> ${listing.id || 'N/A'} | 
+                                <strong>Year:</strong> ${listing.year || 'N/A'} | 
+                                <strong>Mileage:</strong> ${listing.mileage || 'N/A'} | 
+                                <strong>Fuel:</strong> ${listing.fuel || 'N/A'}
+                            </div>
+                            <div class="details">
+                                <strong>Brand:</strong> ${listing.brand || 'N/A'} | 
+                                <strong>Model:</strong> ${listing.model || 'N/A'} | 
+                                <strong>Location:</strong> ${listing.location || 'N/A'}
+                            </div>
+                            ${listing.url ? `<a href="${listing.url}" target="_blank" class="link">View Details</a>` : ''}
+                            <div class="timestamp">Found at: ${new Date(listing.crawled_at || Date.now()).toLocaleString()}</div>
+                        </div>
+                    `;
+                    
+                    // Thêm vào đầu danh sách (cũ nhất sẽ ở trên)
+                    messagesDiv.insertBefore(listingDiv, messagesDiv.firstChild);
+                }
+                
+                console.log(`displayListings: Rendered ${messagesDiv.children.length} items in DOM`);
+                
+                // Giới hạn số lượng tin hiển thị (giữ lại 50 tin mới nhất ở cuối)
                 while (messagesDiv.children.length > 50) {
-                    messagesDiv.removeChild(messagesDiv.lastChild);
+                    messagesDiv.removeChild(messagesDiv.firstChild);
                 }
             }
 
             // Bắt đầu kết nối khi trang load
             connect();
-
-            // Cập nhật thống kê định kỳ
-            setInterval(async () => {
-                try {
-                    const response = await fetch('/health');
-                    const data = await response.json();
-                    document.getElementById('total-items').textContent = data.total_seen_items;
-                    document.getElementById('cars-crawled').textContent = data.cars_crawled;
-                    document.getElementById('new-items').textContent = data.new_items_found;
-                    document.getElementById('last-update').textContent = data.last_crawl_time ? new Date(data.last_crawl_time).toLocaleTimeString() : 'Never';
-                    
-                    // Cập nhật thông tin proxy
-                    document.getElementById('proxy-enabled').textContent = data.proxy_rotation.enabled ? 'Enabled' : 'Disabled';
-                    document.getElementById('proxy-available').textContent = data.proxy_rotation.available_proxies;
-                    document.getElementById('proxy-failed').textContent = data.proxy_rotation.failed_proxies;
-                    document.getElementById('proxy-auto-fetch').textContent = data.proxy_rotation.auto_fetch_enabled ? 'Enabled' : 'Disabled';
-                    document.getElementById('proxy-free').textContent = data.proxy_rotation.free_proxies || 0;
-                    document.getElementById('proxy-manual').textContent = data.proxy_rotation.manual_proxies || 0;
-                } catch (e) {
-                    console.error('Error fetching stats:', e);
-                }
-            }, 5000);
-            
-            // Hàm fetch proxy free
-            async function fetchProxies() {
-                try {
-                    const response = await fetch('/proxy/fetch', { method: 'POST' });
-                    const data = await response.json();
-                    alert(data.message || data.error);
-                } catch (e) {
-                    alert('Error fetching proxies: ' + e.message);
-                }
-            }
-            
-            // Hàm reset proxy bị lỗi
-            async function resetProxies() {
-                try {
-                    const response = await fetch('/proxy/reset', { method: 'POST' });
-                    const data = await response.json();
-                    alert(data.message);
-                } catch (e) {
-                    alert('Error resetting proxies: ' + e.message);
-                }
-            }
             
         </script>
     </body>
@@ -1667,6 +1331,23 @@ async def websocket_endpoint(websocket: WebSocket):
             }),
             websocket
         )
+        
+        # Gửi new_listings_array ban đầu nếu có
+        new_listings_copy = crawler.new_listings_array.copy()
+        if new_listings_copy:
+            # Không đảo ngược ở server, để frontend tự xử lý
+            # new_listings_array có mới nhất ở đầu
+            initial_message = {
+                'type': 'initial_listings',
+                'data': new_listings_copy,  # Gửi nguyên vẹn, không đảo ngược
+                'timestamp': datetime.now().isoformat(),
+                'count': len(new_listings_copy)
+            }
+            # logger.info(f"Sending initial_listings to new client: {len(new_listings_copy)} items")
+            await websocket_manager.send_personal_message(
+                json.dumps(initial_message),
+                websocket
+            )
         
         # Giữ kết nối mở
         while True:
@@ -1695,8 +1376,6 @@ async def websocket_endpoint(websocket: WebSocket):
 # =============================================================================
 
 if __name__ == "__main__":
-    logger.info("Starting Willhaben Crawler Backend...")
-    
     # Chạy server
     uvicorn.run(
         app,
