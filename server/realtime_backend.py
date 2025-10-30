@@ -17,8 +17,11 @@ import os
 import random
 import time
 from datetime import datetime
-from typing import Dict, List, Set, Optional, Any
+from typing import Dict, List, Optional, Any, Set
 from urllib.parse import urljoin, urlparse
+import multiprocessing
+import queue as std_queue
+import signal
 
 import aiohttp
 from bs4 import BeautifulSoup
@@ -56,14 +59,8 @@ class Config:
         # "http://username:password@proxy4:port"
     ]
     PROXY_TIMEOUT = 10  # Timeout cho proxy requests
-    FREE_PROXY_SOURCES = [
-        "https://www.proxy-list.download/api/v1/get?type=http",
-        "https://api.proxyscrape.com/v2/?request=get&protocol=http&timeout=10000&country=all&ssl=all&anonymity=all",
-        "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
-        "https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt"
-    ]
-    MAX_FREE_PROXIES = 50  # Số lượng proxy free tối đa
-    PROXY_FETCH_INTERVAL = 300  # Thời gian fetch proxy mới (giây)
+    MAX_FREE_PROXIES = 10  # Số lượng proxy free tối đa
+    PROXY_FETCH_INTERVAL = 10  # Thời gian fetch proxy mới (giây)
     
     # WebSocket settings
     MAX_CONNECTIONS = 100
@@ -97,39 +94,73 @@ logger = setup_logging()
 # PROXY MANAGER
 # =============================================================================
 
+def _mp_free_proxy_producer(base_url: str, out_q: multiprocessing.Queue, stop_event: multiprocessing.Event, backoff_max: float = 60.0):
+    """Tiến trình producer: liên tục fetch proxy free và đẩy vào hàng đợi."""
+    # Đảm bảo tiến trình thoát khi nhận tín hiệu
+    signal.signal(signal.SIGTERM, lambda *_: stop_event.set())
+    signal.signal(signal.SIGINT, lambda *_: stop_event.set())
+    try:
+        try:
+            from fp.fp import FreeProxy
+        except ImportError:
+            from fp import FreeProxy
+    except Exception:
+        FreeProxy = None  # type: ignore
+    backoff = 1.0
+    while not stop_event.is_set():
+        try:
+            proxy_str = None
+            if FreeProxy is not None:
+                try:
+                    proxy = FreeProxy(url=base_url)
+                    proxy_str = proxy.get()
+                except Exception:
+                    proxy_str = None
+            if proxy_str:
+                if not proxy_str.startswith('http'):
+                    proxy_str = f"http://{proxy_str}"
+                try:
+                    out_q.put(proxy_str, block=False)
+                except Exception:
+                    time.sleep(0.1)
+                backoff = 1.0
+                time.sleep(0.05)
+            else:
+                time.sleep(backoff)
+                backoff = min(backoff_max, backoff * 2)
+        except KeyboardInterrupt:
+            break
+        except Exception:
+            time.sleep(backoff)
+            backoff = min(backoff_max, backoff * 2)
+
 class ProxyManager:
-    """Quản lý proxy rotation"""
+    """Quản lý proxy: user proxies (nếu bật) và pool free-proxy chạy nền (multiprocess)."""
     
     def __init__(self):
         self.proxy_list = [proxy for proxy in Config.PROXY_LIST if proxy.strip()]
         self.current_proxy_index = 0
-        self.failed_proxies = set()
         self.logger = logging.getLogger("ProxyManager")
         self.last_fetch_time = None
+        # Pool proxy free chạy nền (tối đa MAX_FREE_PROXIES)
+        self.free_proxies: List[str] = []
+        self._pool_lock = asyncio.Lock()
+        self._stopping = False
+        # Multiprocessing producer/consumer
+        self._mp_queue: Optional[multiprocessing.Queue] = None
+        self._mp_proc: Optional[multiprocessing.Process] = None
+        self._consumer_task: Optional[asyncio.Task] = None
+        self._mp_stop: Optional[multiprocessing.Event] = None
     
     def get_random_proxy(self) -> Optional[str]:
         """Lấy proxy ngẫu nhiên"""
         if not self.proxy_list:
             return None
         
-        available_proxies = [p for p in self.proxy_list if p not in self.failed_proxies]
-        
-        if not available_proxies:
-            self.failed_proxies.clear()
-            available_proxies = self.proxy_list
-        
-        if not available_proxies:
+        if not self.proxy_list:
             return None
         
-        return random.choice(available_proxies)
-    
-    def is_proxy_available(self) -> bool:
-        """Kiểm tra có proxy nào khả dụng không"""
-        if not self.proxy_list:
-            return False
-        
-        available_proxies = [p for p in self.proxy_list if p not in self.failed_proxies]
-        return len(available_proxies) > 0
+        return random.choice(self.proxy_list)
     
     def _parse_proxy_ip(self, proxy: str) -> str:
         """Parse IP/host từ proxy URL"""
@@ -151,9 +182,122 @@ class ProxyManager:
                 return proxy
     
     def mark_proxy_failed(self, proxy: str):
-        """Đánh dấu proxy bị lỗi và xóa khỏi cache"""
-        if proxy:
-            self.failed_proxies.add(proxy)
+        """Loại bỏ proxy lỗi khỏi pool free (producer sẽ tiếp tục bổ sung)."""
+        if not proxy:
+            return
+        try:
+            if proxy:
+                proxy_ip = self.proxy_manager._parse_proxy_ip(proxy)
+                self.logger.error(f"Error fetching via Proxy IP: {proxy_ip}")
+            if proxy in self.free_proxies:
+                self.free_proxies = [p for p in self.free_proxies if p != proxy]
+        except Exception:
+            pass
+
+    def get_random_free_proxy(self) -> Optional[str]:
+        """Chọn ngẫu nhiên proxy từ danh sách free_proxies (nếu có)."""
+        if not self.free_proxies:
+            return None
+        return random.choice(self.free_proxies)
+
+    # async def _get_free_proxy_from_library_async(self) -> Optional[str]:
+    #     """Không dùng trong chế độ multiprocessing (chỉ để fallback nếu cần)."""
+    #     if self._stopping:
+    #         return None
+    #     try:
+    #         return await asyncio.wait_for(asyncio.to_thread(self.get_free_proxy_from_library), timeout=2.0)
+    #     except (asyncio.TimeoutError, asyncio.CancelledError):
+    #         return None
+
+    async def _drain_queue_once(self):
+        """Lấy proxy từ queue và cập nhật pool (không block)."""
+        if self._mp_queue is None:
+            return
+        try:
+            while len(self.free_proxies) < Config.MAX_FREE_PROXIES:
+                try:
+                    proxy = self._mp_queue.get_nowait()
+                except std_queue.Empty:
+                    break
+                if not proxy:
+                    break
+                async with self._pool_lock:
+                    if proxy not in self.free_proxies:
+                        self.free_proxies.append(proxy)
+                        if len(self.free_proxies) > Config.MAX_FREE_PROXIES:
+                            self.free_proxies = self.free_proxies[-Config.MAX_FREE_PROXIES:]
+        except Exception as e:
+            self.logger.debug(f"Error draining proxy queue: {e}")
+
+    async def _consumer_loop(self):
+        """Tiêu thụ proxy từ queue để duy trì pool free_proxies."""
+        self.logger.info("Starting free proxy consumer loop")
+        try:
+            # Drain ngay khi khởi động để có proxy sớm
+            await self._drain_queue_once()
+            while not self._stopping:
+                await self._drain_queue_once()
+                await asyncio.sleep(0.2)
+        except asyncio.CancelledError:
+            self.logger.info("Free proxy consumer loop stopped")
+            raise
+        except Exception as e:
+            self.logger.error(f"Free proxy consumer loop error: {e}")
+
+    def start_free_proxy_fetcher(self):
+        """Khởi động producer process và consumer loop cho pool proxy free."""
+        if Config.USE_PROXY_ROTATION and len(Config.PROXY_LIST) > 0:
+            return
+        self._stopping = False
+        # Khởi động producer nếu chưa
+        if not (self._mp_proc and self._mp_proc.is_alive()):
+            self._mp_queue = multiprocessing.Queue(maxsize=Config.MAX_FREE_PROXIES * 4)
+            self._mp_stop = multiprocessing.Event()
+            self._mp_proc = multiprocessing.Process(
+                target=_mp_free_proxy_producer,
+                args=(Config.BASE_URL, self._mp_queue, self._mp_stop, 60.0),
+                daemon=True,
+            )
+            self._mp_proc.start()
+        # Khởi động consumer nếu chưa
+        if not self._consumer_task or self._consumer_task.done():
+            self._consumer_task = asyncio.create_task(self._consumer_loop())
+
+    async def stop_free_proxy_fetcher(self):
+        """Dừng vòng lặp fetch proxy free và tiến trình producer."""
+        self._stopping = True
+        if self._consumer_task and not self._consumer_task.done():
+            self._consumer_task.cancel()
+            try:
+                await self._consumer_task
+            except asyncio.CancelledError:
+                pass
+        # Dừng tiến trình producer
+        if self._mp_stop:
+            try:
+                self._mp_stop.set()
+            except Exception:
+                pass
+        if self._mp_proc and self._mp_proc.is_alive():
+            # Chờ tiến trình thoát nhẹ nhàng
+            self._mp_proc.join(timeout=1.0)
+        if self._mp_proc and self._mp_proc.is_alive():
+            # Ép terminate nếu vẫn còn sống
+            try:
+                self._mp_proc.terminate()
+            except Exception:
+                pass
+            self._mp_proc.join(timeout=1.0)
+        if self._mp_proc and self._mp_proc.is_alive():
+            # Kill cứng nếu vẫn chưa thoát
+            try:
+                self._mp_proc.kill()
+            except Exception:
+                pass
+            self._mp_proc.join(timeout=0.5)
+        self._mp_proc = None
+        self._mp_queue = None
+        self._mp_stop = None
     
     def get_free_proxy_from_library(self) -> Optional[str]:
         """Lấy proxy free từ thư viện free-proxy"""
@@ -165,10 +309,10 @@ class ProxyManager:
             
             # Kiểm tra cache và lọc bỏ proxy đã fail
             now = datetime.now()
-            
+            self.logger.info(f"Fetching new free proxy from library... | Time: {now}")
             # Lấy proxy mới từ thư viện
-            self.logger.debug("Fetching new free proxy from library...")
-            proxy = FreeProxy(url='https://www.willhaben.at/iad/gebrauchtwagen/auto/gebrauchtwagenboerse',timeout=0.1)
+            # self.logger.debug("Fetching new free proxy from library...")
+            proxy = FreeProxy(url=Config.BASE_URL,)
             proxy_str = proxy.get()
             
             if proxy_str:
@@ -176,8 +320,8 @@ class ProxyManager:
                 if not proxy_str.startswith('http'):
                     proxy_str = f"http://{proxy_str}"
                 
-                proxy_ip = self._parse_proxy_ip(proxy_str)
-                self.logger.info(f"Got new free proxy from library - IP: {proxy_ip} | URL: {proxy_str}")
+                # proxy_ip = self._parse_proxy_ip(proxy_str)
+                # self.logger.info(f"Got new free proxy from library - IP: {proxy_ip} | URL: {proxy_str}")
                 return proxy_str
             else:
                 self.logger.warning("No proxy available from free-proxy library")
@@ -317,14 +461,20 @@ class WillhabenCrawler:
         
         proxy = None
         
-        if Config.USE_PROXY_ROTATION and self.proxy_manager.is_proxy_available():
+        if Config.USE_PROXY_ROTATION and len(Config.PROXY_LIST) > 0:
             proxy = self.proxy_manager.get_random_proxy()
             if proxy:
                 proxy_ip = self.proxy_manager._parse_proxy_ip(proxy)
                 self.logger.info(f"Fetching data using Proxy IP: {proxy_ip} | Proxy URL: {proxy}")
         elif useProxy:
-            # Dùng thư viện free-proxy để lấy proxy
-            proxy = self.proxy_manager.get_free_proxy_from_library()
+            # Chọn proxy free từ danh sách nền (nếu có); nếu rỗng thì không dùng proxy
+            proxy = self.proxy_manager.get_random_free_proxy()
+            # log thong tin proxy cho toi
+            try:
+                pool_size = len(self.proxy_manager.free_proxies)
+            except Exception:
+                pool_size = 0
+            self.logger.info(f"Free proxy pool size: {pool_size} | Mode: {'proxy' if proxy else 'None'}")
             if proxy:
                 proxy_ip = self.proxy_manager._parse_proxy_ip(proxy)
                 self.logger.info(f"Fetching data using Free Proxy IP: {proxy_ip} | Proxy URL: {proxy}")
@@ -337,36 +487,32 @@ class WillhabenCrawler:
             async with self.session.get(url, headers=headers, proxy=proxy, timeout=timeout) as response:
                 if response.status == 200:
                     content = await response.text()
-                    if proxy:
-                        proxy_ip = self.proxy_manager._parse_proxy_ip(proxy)
-                        self.logger.info(f"Successfully fetched data via Proxy IP: {proxy_ip} | URL: {url}")
-                    else:
-                        self.logger.debug(f"Successfully fetched {url} via direct connection")
+                    # if proxy:
+                    #     proxy_ip = self.proxy_manager._parse_proxy_ip(proxy)
+                    #     self.logger.info(f"Successfully fetched data via Proxy IP: {proxy_ip} | URL: {url}")
+                    # else:
+                    #     self.logger.debug(f"Successfully fetched {url} via direct connection")
                     return content
                 else:
-                    if proxy:
-                        proxy_ip = self.proxy_manager._parse_proxy_ip(proxy)
-                        self.logger.warning(f"HTTP {response.status} for {url} via Proxy IP: {proxy_ip}")
-                    else:
-                        self.logger.warning(f"HTTP {response.status} for {url} via direct connection")
+                    # if proxy:
+                    #     proxy_ip = self.proxy_manager._parse_proxy_ip(proxy)
+                        # self.logger.warning(f"HTTP {response.status} for {url} via Proxy IP: {proxy_ip}")
+                    # else:
+                        # self.logger.warning(f"HTTP {response.status} for {url} via direct connection")
                     
-                    # Đánh dấu proxy fail nếu có lỗi
-                    if proxy and response.status in [403, 407, 502, 503]:
-                        self.proxy_manager.mark_proxy_failed(proxy)
+                    self.proxy_manager.mark_proxy_failed(proxy)
                     
-                    return self.fetch_page(url,useProxy=False)
+                    return await self.fetch_page(url,useProxy=False)
         except Exception as e:
-            if proxy:
-                proxy_ip = self.proxy_manager._parse_proxy_ip(proxy)
-                self.logger.error(f"Error fetching {url} via Proxy IP: {proxy_ip} | Error: {e}")
-            else:
-                self.logger.error(f"Error fetching {url} via direct connection: {e}")
+            # if proxy:
+            #     proxy_ip = self.proxy_manager._parse_proxy_ip(proxy)
+            #     self.logger.error(f"Error fetching {url} via Proxy IP: {proxy_ip} | Error: {e}")
+            # else:
+            #     self.logger.error(f"Error fetching {url} via direct connection: {e}")
             
-            # Đánh dấu proxy fail nếu có exception
-            if proxy:
-                self.proxy_manager.mark_proxy_failed(proxy)
+            self.proxy_manager.mark_proxy_failed(proxy)
             
-            return None
+            return await self.fetch_page(url,useProxy=False)
     
     def parse_car_listings(self, html: str) -> List[Dict[str, Any]]:
         """Parse HTML để trích xuất thông tin xe"""
@@ -917,9 +1063,9 @@ class WillhabenCrawler:
                         for i, item in enumerate(self.new_listings_array[:10], 1):  # Log 10 items đầu tiên
                             item_id = item.get('id', 'N/A')
                             item_title = item.get('title', 'N/A')
-                            self.logger.info(f"  [{i}] ID: {item_id} | Title: {item_title}")
-                        if len(self.new_listings_array) > 10:
-                            self.logger.info(f"  ... và {len(self.new_listings_array) - 10} items khác")
+                            # self.logger.info(f"  [{i}] ID: {item_id} | Title: {item_title}")
+                        # if len(self.new_listings_array) > 10:
+                            # self.logger.info(f"  ... và {len(self.new_listings_array) - 10} items khác")
                     
                     # Broadcast toàn bộ array cho WebSocket
                     broadcast_data = {
@@ -1068,6 +1214,9 @@ async def startup_event():
     """Khởi tạo khi ứng dụng bắt đầu"""
     # Tạo crawler session
     await crawler.create_session()
+
+    # Khởi động fetch proxy free (multiprocessing producer + async consumer)
+    crawler.proxy_manager.start_free_proxy_fetcher()
     
     # Bắt đầu crawler loop
     asyncio.create_task(crawler.crawl_loop())
@@ -1081,6 +1230,8 @@ async def shutdown_event():
     
     # Đóng session
     await crawler.close_session()
+    # Dừng vòng lặp fetch proxy free và tiến trình producer
+    await crawler.proxy_manager.stop_free_proxy_fetcher()
 
 
 @app.get("/")
